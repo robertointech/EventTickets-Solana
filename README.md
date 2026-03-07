@@ -4,6 +4,8 @@ CRUD completo de eventos y tickets on-chain desarrollado con **Rust + Anchor** p
 
 > 📚 Proyecto final para el **Solana LATAM Builders Program** de WayLearn × Solana Foundation.
 
+> **Program ID:** `EFzK4HY7f8yr9qqsMJcPunCTwHF9cA69h265UR58bvj1`
+
 ---
 
 ## 🚀 Operaciones del Programa
