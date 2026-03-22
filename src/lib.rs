@@ -1,23 +1,29 @@
 use anchor_lang::prelude::*;
+use anchor_lang::solana_program::sysvar;
+use anchor_spl::token::{self, Mint, MintTo, Token, TokenAccount};
+use mpl_token_metadata::{
+    instructions::CreateV1CpiBuilder,
+    types::{PrintSupply, TokenStandard},
+};
 
-declare_id!("11111111111111111111111111111111");
+declare_id!("EFzK4HY7f8yr9qqsMJcPunCTwHF9cA69h265UR58bvj1");
 
-/// PROGRAMA: EventTickets
-/// CRUD completo de gestión de eventos y tickets en Solana.
-/// Cada evento es una PDA derivada del creador y un ID único.
-/// Los tickets son PDAs derivadas del evento y el comprador.
-///
-/// Operaciones:
-///   - create_event:  Crea un nuevo evento con nombre, descripción, precio y capacidad
-///   - update_event:  Actualiza los datos de un evento existente (solo el creador)
-///   - buy_ticket:    Compra un ticket para un evento (crea PDA de ticket)
-///   - cancel_ticket: Cancela un ticket existente (cierra la cuenta)
-///   - close_event:   Cierra un evento y recupera el rent (solo el creador)
+/// Event type constants
+pub const EVENT_TYPE_CONFERENCE: u8 = 0;
+pub const EVENT_TYPE_RESEARCH: u8 = 1;
+pub const EVENT_TYPE_ART: u8 = 2;
+pub const EVENT_TYPE_COMMUNITY: u8 = 3;
+pub const EVENT_TYPE_OTHER: u8 = 4;
+
+/// Loyalty threshold: 3+ POAPs from same authority = 20% discount
+pub const LOYALTY_THRESHOLD: u8 = 3;
+pub const LOYALTY_DISCOUNT_BPS: u64 = 2000; // 20% in basis points
+
 #[program]
 pub mod event_tickets {
     use super::*;
 
-    /// CREATE - Crear un nuevo evento
+    /// CREATE - Crear un nuevo evento con tipo
     pub fn create_event(
         ctx: Context<CreateEvent>,
         event_id: u64,
@@ -25,10 +31,12 @@ pub mod event_tickets {
         description: String,
         ticket_price: u64,
         max_tickets: u16,
+        event_type: u8,
     ) -> Result<()> {
         require!(name.len() <= 50, EventError::NameTooLong);
         require!(description.len() <= 200, EventError::DescriptionTooLong);
         require!(max_tickets > 0, EventError::InvalidCapacity);
+        require!(event_type <= EVENT_TYPE_OTHER, EventError::InvalidEventType);
 
         let event = &mut ctx.accounts.event;
         event.authority = ctx.accounts.authority.key();
@@ -39,9 +47,10 @@ pub mod event_tickets {
         event.max_tickets = max_tickets;
         event.tickets_sold = 0;
         event.is_active = true;
+        event.event_type = event_type;
         event.bump = ctx.bumps.event;
 
-        msg!("Evento creado: {} (ID: {})", event.name, event.event_id);
+        msg!("Event created: {} (ID: {}, type: {})", event.name, event.event_id, event.event_type);
         Ok(())
     }
 
@@ -67,12 +76,13 @@ pub mod event_tickets {
         event.ticket_price = ticket_price;
         event.max_tickets = max_tickets;
 
-        msg!("Evento actualizado: {}", event.name);
+        msg!("Event updated: {}", event.name);
         Ok(())
     }
 
-    /// CREATE (Ticket) - Comprar un ticket para un evento
-    pub fn buy_ticket(ctx: Context<BuyTicket>) -> Result<()> {
+    /// BUY TICKET - Comprar ticket con descuento por loyalty
+    /// Si el comprador tiene 3+ AttendanceRecords del mismo authority, 20% off
+    pub fn buy_ticket(ctx: Context<BuyTicket>, loyalty_count: u8) -> Result<()> {
         let event = &mut ctx.accounts.event;
 
         require!(event.is_active, EventError::EventNotActive);
@@ -81,11 +91,25 @@ pub mod event_tickets {
             EventError::EventSoldOut
         );
 
-        if event.ticket_price > 0 {
+        // Calculate price with potential loyalty discount
+        let mut final_price = event.ticket_price;
+        if loyalty_count >= LOYALTY_THRESHOLD {
+            // Loyalty discount: 20% off
+            let discount = event
+                .ticket_price
+                .checked_mul(LOYALTY_DISCOUNT_BPS)
+                .unwrap()
+                .checked_div(10_000)
+                .unwrap();
+            final_price = event.ticket_price.checked_sub(discount).unwrap();
+            msg!("Loyalty discount applied! {} -> {} lamports", event.ticket_price, final_price);
+        }
+
+        if final_price > 0 {
             let transfer_ix = anchor_lang::solana_program::system_instruction::transfer(
                 &ctx.accounts.buyer.key(),
                 &ctx.accounts.event_authority.key(),
-                event.ticket_price,
+                final_price,
             );
             anchor_lang::solana_program::program::invoke(
                 &transfer_ix,
@@ -99,16 +123,111 @@ pub mod event_tickets {
         let ticket = &mut ctx.accounts.ticket;
         ticket.event = event.key();
         ticket.owner = ctx.accounts.buyer.key();
-        ticket.purchase_price = event.ticket_price;
+        ticket.purchase_price = final_price;
         ticket.is_valid = true;
         ticket.bump = ctx.bumps.ticket;
 
         event.tickets_sold += 1;
 
         msg!(
-            "Ticket comprado para evento '{}' por {}",
+            "Ticket purchased for '{}' by {} (paid: {} lamports)",
             event.name,
-            ctx.accounts.buyer.key()
+            ctx.accounts.buyer.key(),
+            final_price
+        );
+        Ok(())
+    }
+
+    /// MINT TICKET NFT - Mint an NFT representing the ticket
+    /// Uses Metaplex Token Metadata via CPI
+    pub fn mint_ticket_nft(ctx: Context<MintTicketNft>, uri: String) -> Result<()> {
+        let event = &ctx.accounts.event;
+        let ticket = &ctx.accounts.ticket;
+
+        require!(ticket.is_valid, EventError::TicketNotValid);
+        require!(ticket.owner == ctx.accounts.buyer.key(), EventError::NotTicketOwner);
+
+        // Mint one token to the buyer's token account
+        let cpi_accounts = MintTo {
+            mint: ctx.accounts.nft_mint.to_account_info(),
+            to: ctx.accounts.nft_token_account.to_account_info(),
+            authority: ctx.accounts.buyer.to_account_info(),
+        };
+        let cpi_ctx = CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts);
+        token::mint_to(cpi_ctx, 1)?;
+
+        // Create metadata via Metaplex CPI
+        let nft_name = format!("{} - Ticket #{}", event.name, event.tickets_sold);
+        // Truncate to 32 chars (Metaplex limit)
+        let nft_name = if nft_name.len() > 32 {
+            nft_name[..32].to_string()
+        } else {
+            nft_name
+        };
+
+        CreateV1CpiBuilder::new(&ctx.accounts.token_metadata_program)
+            .metadata(&ctx.accounts.metadata)
+            .mint(&ctx.accounts.nft_mint.to_account_info(), false)
+            .authority(&ctx.accounts.buyer.to_account_info())
+            .payer(&ctx.accounts.buyer.to_account_info())
+            .update_authority(&ctx.accounts.buyer.to_account_info(), true)
+            .system_program(&ctx.accounts.system_program.to_account_info())
+            .sysvar_instructions(&ctx.accounts.sysvar_instructions)
+            .spl_token_program(&ctx.accounts.token_program.to_account_info())
+            .name(nft_name)
+            .symbol(String::from("BTKT"))
+            .uri(uri)
+            .seller_fee_basis_points(0)
+            .token_standard(TokenStandard::NonFungible)
+            .print_supply(PrintSupply::Zero)
+            .invoke()?;
+
+        msg!("NFT ticket minted for event '{}'", event.name);
+        Ok(())
+    }
+
+    /// ISSUE POAP - Authority issues attendance record
+    pub fn issue_poap(ctx: Context<IssuePoap>) -> Result<()> {
+        let event = &ctx.accounts.event;
+        let clock = Clock::get()?;
+
+        let record = &mut ctx.accounts.attendance_record;
+        record.event = event.key();
+        record.attendee = ctx.accounts.attendee.key();
+        record.authority = event.authority;
+        record.attended_at = clock.unix_timestamp;
+        record.bump = ctx.bumps.attendance_record;
+
+        msg!(
+            "POAP issued for '{}' to {}",
+            event.name,
+            ctx.accounts.attendee.key()
+        );
+        Ok(())
+    }
+
+    /// LEAVE REVIEW - Ticket holder leaves a review
+    pub fn leave_review(ctx: Context<LeaveReview>, rating: u8, comment: String) -> Result<()> {
+        require!(rating >= 1 && rating <= 5, EventError::InvalidRating);
+        require!(comment.len() <= 280, EventError::CommentTooLong);
+
+        let ticket = &ctx.accounts.ticket;
+        require!(ticket.is_valid, EventError::TicketNotValid);
+
+        let clock = Clock::get()?;
+        let review = &mut ctx.accounts.review;
+        review.event = ctx.accounts.event.key();
+        review.reviewer = ctx.accounts.reviewer.key();
+        review.rating = rating;
+        review.comment = comment;
+        review.timestamp = clock.unix_timestamp;
+        review.bump = ctx.bumps.review;
+
+        msg!(
+            "Review left for '{}' by {} (rating: {})",
+            ctx.accounts.event.name,
+            ctx.accounts.reviewer.key(),
+            rating
         );
         Ok(())
     }
@@ -119,7 +238,7 @@ pub mod event_tickets {
         event.tickets_sold -= 1;
 
         msg!(
-            "Ticket cancelado para evento '{}' por {}",
+            "Ticket cancelled for '{}' by {}",
             event.name,
             ctx.accounts.owner.key()
         );
@@ -135,12 +254,15 @@ pub mod event_tickets {
             EventError::EventHasTickets
         );
 
-        msg!("Evento cerrado: {} (ID: {})", event.name, event.event_id);
+        msg!("Event closed: {} (ID: {})", event.name, event.event_id);
         Ok(())
     }
 }
 
+// ═══════════════════════════════════════════════
 // CONTEXTOS
+// ═══════════════════════════════════════════════
+
 #[derive(Accounts)]
 #[instruction(event_id: u64)]
 pub struct CreateEvent<'info> {
@@ -204,6 +326,111 @@ pub struct BuyTicket<'info> {
 }
 
 #[derive(Accounts)]
+pub struct MintTicketNft<'info> {
+    #[account(
+        seeds = [event.authority.as_ref(), b"event", &event.event_id.to_le_bytes()],
+        bump = event.bump
+    )]
+    pub event: Account<'info, Event>,
+
+    #[account(
+        has_one = owner @ EventError::NotTicketOwner,
+        seeds = [event.key().as_ref(), b"ticket", buyer.key().as_ref()],
+        bump = ticket.bump
+    )]
+    pub ticket: Account<'info, Ticket>,
+
+    #[account(mut)]
+    pub nft_mint: Account<'info, Mint>,
+
+    #[account(
+        mut,
+        constraint = nft_token_account.mint == nft_mint.key(),
+        constraint = nft_token_account.owner == buyer.key()
+    )]
+    pub nft_token_account: Account<'info, TokenAccount>,
+
+    /// CHECK: Metaplex metadata PDA, validated by token metadata program
+    #[account(mut)]
+    pub metadata: AccountInfo<'info>,
+
+    #[account(
+        mut,
+        constraint = buyer.key() == ticket.owner @ EventError::NotTicketOwner
+    )]
+    pub buyer: Signer<'info>,
+
+    /// CHECK: Token Metadata program
+    #[account(address = mpl_token_metadata::ID)]
+    pub token_metadata_program: AccountInfo<'info>,
+
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+
+    /// CHECK: Sysvar instructions
+    #[account(address = sysvar::instructions::id())]
+    pub sysvar_instructions: AccountInfo<'info>,
+}
+
+#[derive(Accounts)]
+pub struct IssuePoap<'info> {
+    #[account(
+        has_one = authority,
+        seeds = [authority.key().as_ref(), b"event", &event.event_id.to_le_bytes()],
+        bump = event.bump
+    )]
+    pub event: Account<'info, Event>,
+
+    #[account(
+        init,
+        payer = authority,
+        space = AttendanceRecord::SPACE,
+        seeds = [attendee.key().as_ref(), b"poap", event.key().as_ref()],
+        bump
+    )]
+    pub attendance_record: Account<'info, AttendanceRecord>,
+
+    /// CHECK: The attendee wallet receiving the POAP
+    pub attendee: AccountInfo<'info>,
+
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct LeaveReview<'info> {
+    #[account(
+        seeds = [event.authority.as_ref(), b"event", &event.event_id.to_le_bytes()],
+        bump = event.bump
+    )]
+    pub event: Account<'info, Event>,
+
+    #[account(
+        has_one = owner @ EventError::NotTicketOwner,
+        seeds = [event.key().as_ref(), b"ticket", reviewer.key().as_ref()],
+        bump = ticket.bump,
+        constraint = ticket.owner == reviewer.key() @ EventError::NotTicketOwner
+    )]
+    pub ticket: Account<'info, Ticket>,
+
+    #[account(
+        init,
+        payer = reviewer,
+        space = Review::SPACE,
+        seeds = [event.key().as_ref(), b"review", reviewer.key().as_ref()],
+        bump
+    )]
+    pub review: Account<'info, Review>,
+
+    #[account(mut)]
+    pub reviewer: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
 pub struct CancelTicket<'info> {
     #[account(
         mut,
@@ -240,7 +467,10 @@ pub struct CloseEvent<'info> {
     pub authority: Signer<'info>,
 }
 
+// ═══════════════════════════════════════════════
 // CUENTAS
+// ═══════════════════════════════════════════════
+
 #[account]
 pub struct Event {
     pub authority: Pubkey,
@@ -251,11 +481,13 @@ pub struct Event {
     pub max_tickets: u16,
     pub tickets_sold: u16,
     pub is_active: bool,
+    pub event_type: u8,
     pub bump: u8,
 }
 
 impl Event {
-    pub const SPACE: usize = 8 + 32 + 8 + (4 + 50) + (4 + 200) + 8 + 2 + 2 + 1 + 1;
+    // 8 (discriminator) + 32 + 8 + (4+50) + (4+200) + 8 + 2 + 2 + 1 + 1 + 1
+    pub const SPACE: usize = 8 + 32 + 8 + (4 + 50) + (4 + 200) + 8 + 2 + 2 + 1 + 1 + 1;
 }
 
 #[account]
@@ -271,23 +503,65 @@ impl Ticket {
     pub const SPACE: usize = 8 + 32 + 32 + 8 + 1 + 1;
 }
 
+#[account]
+pub struct AttendanceRecord {
+    pub event: Pubkey,
+    pub attendee: Pubkey,
+    pub authority: Pubkey,
+    pub attended_at: i64,
+    pub bump: u8,
+}
+
+impl AttendanceRecord {
+    // 8 + 32 + 32 + 32 + 8 + 1
+    pub const SPACE: usize = 8 + 32 + 32 + 32 + 8 + 1;
+}
+
+#[account]
+pub struct Review {
+    pub event: Pubkey,
+    pub reviewer: Pubkey,
+    pub rating: u8,
+    pub comment: String,
+    pub timestamp: i64,
+    pub bump: u8,
+}
+
+impl Review {
+    // 8 + 32 + 32 + 1 + (4+280) + 8 + 1
+    pub const SPACE: usize = 8 + 32 + 32 + 1 + (4 + 280) + 8 + 1;
+}
+
+// ═══════════════════════════════════════════════
 // ERRORES
+// ═══════════════════════════════════════════════
+
 #[error_code]
 pub enum EventError {
-    #[msg("El nombre del evento no puede superar los 50 caracteres.")]
+    #[msg("Event name cannot exceed 50 characters.")]
     NameTooLong,
-    #[msg("La descripción no puede superar los 200 caracteres.")]
+    #[msg("Description cannot exceed 200 characters.")]
     DescriptionTooLong,
-    #[msg("La capacidad debe ser mayor a 0.")]
+    #[msg("Capacity must be greater than 0.")]
     InvalidCapacity,
-    #[msg("El evento no está activo.")]
+    #[msg("Event is not active.")]
     EventNotActive,
-    #[msg("El evento está agotado, no hay tickets disponibles.")]
+    #[msg("Event is sold out.")]
     EventSoldOut,
-    #[msg("No se puede reducir la capacidad por debajo de los tickets vendidos.")]
+    #[msg("Cannot reduce capacity below tickets already sold.")]
     CannotReduceBelowSold,
-    #[msg("El evento todavía tiene tickets vendidos, no se puede cerrar.")]
+    #[msg("Event still has tickets sold, cannot close.")]
     EventHasTickets,
-    #[msg("La authority del evento no coincide.")]
+    #[msg("Event authority mismatch.")]
     InvalidAuthority,
+    #[msg("Invalid event type (must be 0-4).")]
+    InvalidEventType,
+    #[msg("Ticket is not valid.")]
+    TicketNotValid,
+    #[msg("Not the ticket owner.")]
+    NotTicketOwner,
+    #[msg("Rating must be between 1 and 5.")]
+    InvalidRating,
+    #[msg("Comment cannot exceed 280 characters.")]
+    CommentTooLong,
 }
