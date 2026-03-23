@@ -1,10 +1,4 @@
 use anchor_lang::prelude::*;
-use anchor_lang::solana_program::sysvar;
-use anchor_spl::token::{self, Mint, MintTo, Token, TokenAccount};
-use mpl_token_metadata::{
-    instructions::CreateV1CpiBuilder,
-    types::{PrintSupply, TokenStandard},
-};
 
 declare_id!("EFzK4HY7f8yr9qqsMJcPunCTwHF9cA69h265UR58bvj1");
 
@@ -135,54 +129,6 @@ pub mod event_tickets {
             ctx.accounts.buyer.key(),
             final_price
         );
-        Ok(())
-    }
-
-    /// MINT TICKET NFT - Mint an NFT representing the ticket
-    /// Uses Metaplex Token Metadata via CPI
-    pub fn mint_ticket_nft(ctx: Context<MintTicketNft>, uri: String) -> Result<()> {
-        let event = &ctx.accounts.event;
-        let ticket = &ctx.accounts.ticket;
-
-        require!(ticket.is_valid, EventError::TicketNotValid);
-        require!(ticket.owner == ctx.accounts.buyer.key(), EventError::NotTicketOwner);
-
-        // Mint one token to the buyer's token account
-        let cpi_accounts = MintTo {
-            mint: ctx.accounts.nft_mint.to_account_info(),
-            to: ctx.accounts.nft_token_account.to_account_info(),
-            authority: ctx.accounts.buyer.to_account_info(),
-        };
-        let cpi_ctx = CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts);
-        token::mint_to(cpi_ctx, 1)?;
-
-        // Create metadata via Metaplex CPI
-        let nft_name = format!("{} - Ticket #{}", event.name, event.tickets_sold);
-        // Truncate to 32 chars (Metaplex limit)
-        let nft_name = if nft_name.len() > 32 {
-            nft_name[..32].to_string()
-        } else {
-            nft_name
-        };
-
-        CreateV1CpiBuilder::new(&ctx.accounts.token_metadata_program)
-            .metadata(&ctx.accounts.metadata)
-            .mint(&ctx.accounts.nft_mint.to_account_info(), false)
-            .authority(&ctx.accounts.buyer.to_account_info())
-            .payer(&ctx.accounts.buyer.to_account_info())
-            .update_authority(&ctx.accounts.buyer.to_account_info(), true)
-            .system_program(&ctx.accounts.system_program.to_account_info())
-            .sysvar_instructions(&ctx.accounts.sysvar_instructions)
-            .spl_token_program(&ctx.accounts.token_program.to_account_info())
-            .name(nft_name)
-            .symbol(String::from("BTKT"))
-            .uri(uri)
-            .seller_fee_basis_points(0)
-            .token_standard(TokenStandard::NonFungible)
-            .print_supply(PrintSupply::Zero)
-            .invoke()?;
-
-        msg!("NFT ticket minted for event '{}'", event.name);
         Ok(())
     }
 
@@ -323,53 +269,6 @@ pub struct BuyTicket<'info> {
     pub buyer: Signer<'info>,
 
     pub system_program: Program<'info, System>,
-}
-
-#[derive(Accounts)]
-pub struct MintTicketNft<'info> {
-    #[account(
-        seeds = [event.authority.as_ref(), b"event", &event.event_id.to_le_bytes()],
-        bump = event.bump
-    )]
-    pub event: Account<'info, Event>,
-
-    #[account(
-        has_one = owner @ EventError::NotTicketOwner,
-        seeds = [event.key().as_ref(), b"ticket", buyer.key().as_ref()],
-        bump = ticket.bump
-    )]
-    pub ticket: Account<'info, Ticket>,
-
-    #[account(mut)]
-    pub nft_mint: Account<'info, Mint>,
-
-    #[account(
-        mut,
-        constraint = nft_token_account.mint == nft_mint.key(),
-        constraint = nft_token_account.owner == buyer.key()
-    )]
-    pub nft_token_account: Account<'info, TokenAccount>,
-
-    /// CHECK: Metaplex metadata PDA, validated by token metadata program
-    #[account(mut)]
-    pub metadata: AccountInfo<'info>,
-
-    #[account(
-        mut,
-        constraint = buyer.key() == ticket.owner @ EventError::NotTicketOwner
-    )]
-    pub buyer: Signer<'info>,
-
-    /// CHECK: Token Metadata program
-    #[account(address = mpl_token_metadata::ID)]
-    pub token_metadata_program: AccountInfo<'info>,
-
-    pub token_program: Program<'info, Token>,
-    pub system_program: Program<'info, System>,
-
-    /// CHECK: Sysvar instructions
-    #[account(address = sysvar::instructions::id())]
-    pub sysvar_instructions: AccountInfo<'info>,
 }
 
 #[derive(Accounts)]
