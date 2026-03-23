@@ -17,7 +17,7 @@ pub const LOYALTY_DISCOUNT_BPS: u64 = 2000; // 20% in basis points
 pub mod event_tickets {
     use super::*;
 
-    /// CREATE - Crear un nuevo evento con tipo
+    /// CREATE - Create a new event with type
     pub fn create_event(
         ctx: Context<CreateEvent>,
         event_id: u64,
@@ -48,7 +48,7 @@ pub mod event_tickets {
         Ok(())
     }
 
-    /// UPDATE - Actualizar datos de un evento existente
+    /// UPDATE - Update an existing event (authority only via has_one)
     pub fn update_event(
         ctx: Context<UpdateEvent>,
         name: String,
@@ -74,9 +74,10 @@ pub mod event_tickets {
         Ok(())
     }
 
-    /// BUY TICKET - Comprar ticket con descuento por loyalty
-    /// Si el comprador tiene 3+ AttendanceRecords del mismo authority, 20% off
-    pub fn buy_ticket(ctx: Context<BuyTicket>, loyalty_count: u8) -> Result<()> {
+    /// BUY TICKET - Purchase ticket with on-chain loyalty verification
+    /// Remaining accounts: pass AttendanceRecord PDAs as proof of loyalty.
+    /// The program counts valid records on-chain instead of trusting client input.
+    pub fn buy_ticket(ctx: Context<BuyTicket>) -> Result<()> {
         let event = &mut ctx.accounts.event;
 
         require!(event.is_active, EventError::EventNotActive);
@@ -85,20 +86,55 @@ pub mod event_tickets {
             EventError::EventSoldOut
         );
 
+        // On-chain loyalty verification via remaining_accounts
+        // Each remaining account must be a valid AttendanceRecord PDA
+        // with the same authority as the event and the buyer as attendee
+        let mut loyalty_count: u8 = 0;
+        for account_info in ctx.remaining_accounts.iter() {
+            if account_info.data_len() == AttendanceRecord::SPACE {
+                if let Ok(record) = Account::<AttendanceRecord>::try_from(account_info) {
+                    if record.attendee == ctx.accounts.buyer.key()
+                        && record.authority == event.authority
+                    {
+                        loyalty_count = loyalty_count.saturating_add(1);
+                    }
+                }
+            }
+            if loyalty_count >= LOYALTY_THRESHOLD {
+                break; // No need to check more
+            }
+        }
+
         // Calculate price with potential loyalty discount
         let mut final_price = event.ticket_price;
         if loyalty_count >= LOYALTY_THRESHOLD {
-            // Loyalty discount: 20% off
             let discount = event
                 .ticket_price
                 .checked_mul(LOYALTY_DISCOUNT_BPS)
-                .unwrap()
+                .ok_or(EventError::ArithmeticOverflow)?
                 .checked_div(10_000)
-                .unwrap();
-            final_price = event.ticket_price.checked_sub(discount).unwrap();
+                .ok_or(EventError::ArithmeticOverflow)?;
+            final_price = event
+                .ticket_price
+                .checked_sub(discount)
+                .ok_or(EventError::ArithmeticOverflow)?;
             msg!("Loyalty discount applied! {} -> {} lamports", event.ticket_price, final_price);
         }
 
+        // STATE UPDATE BEFORE TRANSFER (CEI pattern)
+        let ticket = &mut ctx.accounts.ticket;
+        ticket.event = event.key();
+        ticket.owner = ctx.accounts.buyer.key();
+        ticket.purchase_price = final_price;
+        ticket.is_valid = true;
+        ticket.bump = ctx.bumps.ticket;
+
+        event.tickets_sold = event
+            .tickets_sold
+            .checked_add(1)
+            .ok_or(EventError::ArithmeticOverflow)?;
+
+        // TRANSFER AFTER STATE UPDATE
         if final_price > 0 {
             let transfer_ix = anchor_lang::solana_program::system_instruction::transfer(
                 &ctx.accounts.buyer.key(),
@@ -113,15 +149,6 @@ pub mod event_tickets {
                 ],
             )?;
         }
-
-        let ticket = &mut ctx.accounts.ticket;
-        ticket.event = event.key();
-        ticket.owner = ctx.accounts.buyer.key();
-        ticket.purchase_price = final_price;
-        ticket.is_valid = true;
-        ticket.bump = ctx.bumps.ticket;
-
-        event.tickets_sold += 1;
 
         msg!(
             "Ticket purchased for '{}' by {} (paid: {} lamports)",
@@ -178,10 +205,13 @@ pub mod event_tickets {
         Ok(())
     }
 
-    /// DELETE (Ticket) - Cancelar un ticket
+    /// DELETE (Ticket) - Cancel a ticket
     pub fn cancel_ticket(ctx: Context<CancelTicket>) -> Result<()> {
         let event = &mut ctx.accounts.event;
-        event.tickets_sold -= 1;
+        event.tickets_sold = event
+            .tickets_sold
+            .checked_sub(1)
+            .ok_or(EventError::ArithmeticOverflow)?;
 
         msg!(
             "Ticket cancelled for '{}' by {}",
@@ -191,7 +221,7 @@ pub mod event_tickets {
         Ok(())
     }
 
-    /// DELETE (Event) - Cerrar un evento
+    /// DELETE (Event) - Close an event
     pub fn close_event(ctx: Context<CloseEvent>) -> Result<()> {
         let event = &mut ctx.accounts.event;
 
@@ -206,7 +236,7 @@ pub mod event_tickets {
 }
 
 // ═══════════════════════════════════════════════
-// CONTEXTOS
+// CONTEXTS
 // ═══════════════════════════════════════════════
 
 #[derive(Accounts)]
@@ -258,7 +288,7 @@ pub struct BuyTicket<'info> {
     )]
     pub ticket: Account<'info, Ticket>,
 
-    /// CHECK: Wallet del creador del evento que recibe el pago.
+    /// CHECK: Wallet of the event creator that receives payment.
     #[account(
         mut,
         constraint = event_authority.key() == event.authority @ EventError::InvalidAuthority
@@ -367,7 +397,7 @@ pub struct CloseEvent<'info> {
 }
 
 // ═══════════════════════════════════════════════
-// CUENTAS
+// ACCOUNTS
 // ═══════════════════════════════════════════════
 
 #[account]
@@ -432,7 +462,7 @@ impl Review {
 }
 
 // ═══════════════════════════════════════════════
-// ERRORES
+// ERRORS
 // ═══════════════════════════════════════════════
 
 #[error_code]
@@ -463,4 +493,6 @@ pub enum EventError {
     InvalidRating,
     #[msg("Comment cannot exceed 280 characters.")]
     CommentTooLong,
+    #[msg("Arithmetic overflow or underflow.")]
+    ArithmeticOverflow,
 }
